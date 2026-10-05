@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart' as shelf_router;
@@ -272,9 +273,32 @@ class _AppState extends State<App> {
               ),
             ),
             const SizedBox(height: 8),
-            Text(
-              _deviceId == null ? 'Device id: generating...' : 'Device id: $_deviceId',
-              style: const TextStyle(fontSize: 12, color: Colors.grey),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Flexible(
+                  child: Text(
+                    _deviceId == null
+                        ? 'Device id: generating...'
+                        : 'Device id: $_deviceId',
+                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (_deviceId != null)
+                  IconButton(
+                    icon: const Icon(Icons.copy, size: 16),
+                    tooltip: 'Copy device id',
+                    onPressed: () async {
+                      final messenger = ScaffoldMessenger.of(context);
+                      await Clipboard.setData(ClipboardData(text: _deviceId!));
+                      if (!mounted) return;
+                      messenger.showSnackBar(
+                        const SnackBar(content: Text('Device id copied')),
+                      );
+                    },
+                  ),
+              ],
             ),
             const SizedBox(height: 20),
             TextField(
