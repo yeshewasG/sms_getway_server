@@ -4,11 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart' as shelf_router;
-import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:permission_handler/permission_handler.dart';
+import 'services/device_identity_service.dart';
+import 'services/device_registration_service.dart';
+import 'services/socket_service.dart';
 import 'sms_api.dart';
-
-enum SocketStatus { connecting, connected, disconnected }
 
 enum SmsStatus { idle, sending, success, error }
 
@@ -23,6 +23,9 @@ class _AppState extends State<App> {
   SocketStatus _socketStatus = SocketStatus.disconnected;
   SmsStatus _smsStatus = SmsStatus.idle;
   final _smsApi = SmsApi();
+  final _deviceIdentity = DeviceIdentityService();
+  final _deviceRegistration = DeviceRegistrationService();
+  final _socketService = SocketService();
   final _phoneController = TextEditingController();
   final _messageController = TextEditingController();
   final _endpointController = TextEditingController(
@@ -31,24 +34,32 @@ class _AppState extends State<App> {
 
   String _result = '';
   String _serverStatus = 'Starting server...';
+  String? _deviceId;
   HttpServer? _server;
-
-  late IO.Socket socket;
-
-  final String userId = 'yeshi';
 
   @override
   void initState() {
     super.initState();
     _startServer();
-    _connectSocket();
+    _initDeviceAndConnect();
   }
 
-  void _connectSocket() {
+  Future<void> _initDeviceAndConnect() async {
+    final deviceId = await _deviceIdentity.getOrCreateDeviceId();
     setState(() {
-      _socketStatus = SocketStatus.connecting;
-      _result = 'Connecting to socket...';
+      _deviceId = deviceId;
     });
+    await _connectSocket();
+  }
+
+  Future<void> _connectSocket() async {
+    final deviceId = _deviceId;
+    if (deviceId == null) {
+      setState(() {
+        _result = "Device id not ready yet";
+      });
+      return;
+    }
 
     final endpoint = _endpointController.text.trim();
     if (endpoint.isEmpty) {
@@ -59,46 +70,45 @@ class _AppState extends State<App> {
       return;
     }
 
-    socket = IO.io(endpoint, <String, dynamic>{
-      "transports": ["websocket"],
-      "autoConnect": false,
+    setState(() {
+      _socketStatus = SocketStatus.connecting;
+      _result = 'Registering device...';
     });
 
-    socket.connect();
-
-    socket.onConnect((_) {
-      socket.emit('join', userId);
-
-      setState(() {
-        _socketStatus = SocketStatus.connected;
-        _result = "Connected: ${socket.id}";
-      });
-    });
-
-    socket.on("sms", (data) async {
-      await _smsApi.sendSms(phone: data['to'], message: data['content']);
-      setState(() {
-        _result = "📩 SMS received: To ${data['to']} - ${data['content']}";
-      });
-    });
-
-    socket.onError((err) {
-      _socketStatus = SocketStatus.disconnected;
-      setState(() {
-        _result = "Socket error: $err";
-      });
-    });
-
-    socket.onDisconnect((_) {
+    try {
+      await _deviceRegistration.register(
+        endpoint: endpoint,
+        deviceId: deviceId,
+        platform: _deviceIdentity.platformName,
+      );
+    } on DeviceRegistrationException catch (e) {
       setState(() {
         _socketStatus = SocketStatus.disconnected;
-        _result = "Disconnected from socket server";
+        _result = "Device registration failed: ${e.message}";
       });
-    });
+      return;
+    }
+
+    _socketService.connect(
+      endpoint: endpoint,
+      deviceId: deviceId,
+      onStatusChange: (status, message) {
+        setState(() {
+          _socketStatus = status;
+          _result = message;
+        });
+      },
+      onSms: (data) async {
+        await _smsApi.sendSms(phone: data['to'], message: data['content']);
+        setState(() {
+          _result = "📩 SMS received: To ${data['to']} - ${data['content']}";
+        });
+      },
+    );
   }
 
   void _disconnectSocket() {
-    socket.disconnect();
+    _socketService.disconnect();
     setState(() {
       _socketStatus = SocketStatus.disconnected;
       _result = "Socket manually disconnected";
@@ -170,6 +180,7 @@ class _AppState extends State<App> {
   @override
   void dispose() {
     _server?.close();
+    _socketService.dispose();
     _phoneController.dispose();
     _messageController.dispose();
     super.dispose();
@@ -260,7 +271,11 @@ class _AppState extends State<App> {
                         : Colors.green,
               ),
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 8),
+            Text(
+              _deviceId == null ? 'Device id: generating...' : 'Device id: $_deviceId',
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
+            ),
             const SizedBox(height: 20),
             TextField(
               controller: _endpointController,
