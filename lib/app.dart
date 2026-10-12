@@ -8,6 +8,7 @@ import 'package:shelf_router/shelf_router.dart' as shelf_router;
 import 'package:permission_handler/permission_handler.dart';
 import 'services/device_identity_service.dart';
 import 'services/device_registration_service.dart';
+import 'services/settings_service.dart';
 import 'services/socket_service.dart';
 import 'sms_api.dart';
 
@@ -27,11 +28,12 @@ class _AppState extends State<App> {
   final _deviceIdentity = DeviceIdentityService();
   final _deviceRegistration = DeviceRegistrationService();
   final _socketService = SocketService();
+  final _settingsService = SettingsService();
   final _phoneController = TextEditingController();
   final _messageController = TextEditingController();
-  final _endpointController = TextEditingController(
-    text: "https://messaging.adeylab.com",
-  );
+  final _endpointController = TextEditingController();
+  final _tokenController = TextEditingController();
+  final _nameController = TextEditingController();
 
   String _result = '';
   String _serverStatus = 'Starting server...';
@@ -47,10 +49,21 @@ class _AppState extends State<App> {
 
   Future<void> _initDeviceAndConnect() async {
     final deviceId = await _deviceIdentity.getOrCreateDeviceId();
+    final saved = await _settingsService.load();
+    _endpointController.text = saved.endpoint;
+    _tokenController.text = saved.token;
+    _nameController.text = saved.deviceName;
     setState(() {
       _deviceId = deviceId;
     });
-    await _connectSocket();
+    // First launch: wait for the user to enter the server and token.
+    if (saved.isComplete) {
+      await _connectSocket();
+    } else {
+      setState(() {
+        _result = 'Enter your CRM server address and gateway token, then tap Connect.';
+      });
+    }
   }
 
   Future<void> _connectSocket() async {
@@ -62,14 +75,35 @@ class _AppState extends State<App> {
       return;
     }
 
-    final endpoint = _endpointController.text.trim();
-    if (endpoint.isEmpty) {
+    var endpoint = _endpointController.text.trim();
+    while (endpoint.endsWith('/')) {
+      endpoint = endpoint.substring(0, endpoint.length - 1);
+    }
+    final token = _tokenController.text.trim();
+    if (endpoint.isEmpty || token.isEmpty) {
       setState(() {
-        _result = "Please enter a valid Socket endpoint";
+        _result = 'Enter the server address and the gateway token.';
         _socketStatus = SocketStatus.disconnected;
       });
       return;
     }
+
+    // Texts can only be sent once the permission is granted, so ask up front.
+    if (!await _requestSmsPermission()) {
+      setState(() {
+        _socketStatus = SocketStatus.disconnected;
+        if (!_result.contains('permanently')) _result = 'SMS permission is required to send messages.';
+      });
+      return;
+    }
+
+    await _settingsService.save(
+      GatewaySettings(
+        endpoint: endpoint,
+        token: token,
+        deviceName: _nameController.text.trim(),
+      ),
+    );
 
     setState(() {
       _socketStatus = SocketStatus.connecting;
@@ -79,8 +113,10 @@ class _AppState extends State<App> {
     try {
       await _deviceRegistration.register(
         endpoint: endpoint,
+        token: token,
         deviceId: deviceId,
         platform: _deviceIdentity.platformName,
+        name: _nameController.text.trim(),
       );
     } on DeviceRegistrationException catch (e) {
       setState(() {
@@ -92,6 +128,7 @@ class _AppState extends State<App> {
 
     _socketService.connect(
       endpoint: endpoint,
+      token: token,
       deviceId: deviceId,
       onStatusChange: (status, message) {
         setState(() {
@@ -100,10 +137,26 @@ class _AppState extends State<App> {
         });
       },
       onSms: (data) async {
-        await _smsApi.sendSms(phone: data['to'], message: data['content']);
-        setState(() {
-          _result = "📩 SMS received: To ${data['to']} - ${data['content']}";
-        });
+        final to = data['to']?.toString();
+        final content = data['content']?.toString();
+        if (to == null || content == null) return;
+        try {
+          await _smsApi.sendSms(phone: to, message: content);
+          if (!mounted) return;
+          setState(() {
+            _result = 'Sent SMS to $to';
+          });
+        } on SmsApiException catch (e) {
+          if (!mounted) return;
+          setState(() {
+            _result = 'Failed to send SMS to $to: ${e.message}';
+          });
+        } catch (e) {
+          if (!mounted) return;
+          setState(() {
+            _result = 'Failed to send SMS to $to: $e';
+          });
+        }
       },
     );
   }
@@ -121,6 +174,13 @@ class _AppState extends State<App> {
 
     // API endpoint for sending SMS
     router.post('/send_sms', (Request request) async {
+      // Anyone on the network can reach this port, so require the gateway token.
+      final expected = _tokenController.text.trim();
+      if (expected.isEmpty || request.headers['x-gateway-token'] != expected) {
+        return Response.unauthorized(
+          jsonEncode({'status': 'error', 'message': 'Invalid gateway token'}),
+        );
+      }
       try {
         final payload = await request.readAsString();
         if (payload.isEmpty) {
@@ -146,7 +206,7 @@ class _AppState extends State<App> {
         return Response.ok(
           jsonEncode({'status': 'success', 'message': result}),
         );
-      } on FormatException catch (e) {
+      } on FormatException {
         return Response.badRequest(
           body: jsonEncode({
             'status': 'error',
@@ -184,6 +244,9 @@ class _AppState extends State<App> {
     _socketService.dispose();
     _phoneController.dispose();
     _messageController.dispose();
+    _endpointController.dispose();
+    _tokenController.dispose();
+    _nameController.dispose();
     super.dispose();
   }
 
@@ -258,8 +321,8 @@ class _AppState extends State<App> {
   Widget build(BuildContext context) {
     return Scaffold(
       resizeToAvoidBottomInset: true,
-      appBar: AppBar(title: const Text('SMS')),
-      body: Padding(
+      appBar: AppBar(title: const Text('SMS Gateway')),
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(16.0),
         child: Column(
           children: [
@@ -303,10 +366,25 @@ class _AppState extends State<App> {
             const SizedBox(height: 20),
             TextField(
               controller: _endpointController,
+              keyboardType: TextInputType.url,
               decoration: const InputDecoration(
-                labelText: 'Socket Server Endpoint',
-                hintText: 'e.g. https://messaging.adeylab.com',
+                labelText: 'CRM server address',
+                hintText: 'e.g. https://api.yourcompany.com',
               ),
+            ),
+            TextField(
+              controller: _tokenController,
+              obscureText: true,
+              enableSuggestions: false,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                labelText: 'Gateway token',
+                hintText: 'From CRM → Channels → SMS',
+              ),
+            ),
+            TextField(
+              controller: _nameController,
+              decoration: const InputDecoration(labelText: 'Device name'),
             ),
             TextField(
               controller: _phoneController,
@@ -338,7 +416,7 @@ class _AppState extends State<App> {
                               color: Colors.white,
                             ),
                           )
-                          : const Text("Connect Socket"),
+                          : const Text("Connect"),
                 ),
                 const SizedBox(width: 10),
                 ElevatedButton(
@@ -346,7 +424,7 @@ class _AppState extends State<App> {
                       _socketStatus == SocketStatus.connected
                           ? _disconnectSocket
                           : null,
-                  child: const Text("Disconnect Socket"),
+                  child: const Text("Disconnect"),
                 ),
               ],
             ),

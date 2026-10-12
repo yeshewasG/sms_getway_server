@@ -1,87 +1,71 @@
 # SMS Gateway App
 
-A Flutter app that turns an Android phone into an SMS-sending gateway device. It registers itself with the [messaging-service](../messaging-service) backend, stays connected over Socket.IO, and sends real SMS messages (via the phone's own SIM) whenever the backend relays a job to it.
+A Flutter app that turns an Android phone into an SMS-sending gateway for the **Adey CRM**. The phone connects to
+your CRM server, authenticates with your organization's **gateway token**, and sends a real SMS from its own SIM
+whenever the CRM asks it to.
 
----
+## Setup
 
-## How It Works
+1. In the CRM open **Channels → SMS → Set up SMS gateway**. It shows a **server address** and a **gateway token**.
+2. Install and open this app on the phone, then enter:
+   - **CRM server address** — the API address shown in the CRM (e.g. `https://api.yourcompany.com`)
+   - **Gateway token** — copied from the CRM
+   - **Device name** — anything, shown in the CRM's phone list
+3. Tap **Connect** and allow the SMS permission. The phone appears as **Online** in the CRM, and **Send test SMS** there should arrive.
 
-1. **Device identity** — on first launch, the app generates a UUID (`DeviceIdentityService`) and persists it locally via `shared_preferences`. This id is stable across restarts and is never hardcoded.
-2. **Registration** — before connecting the socket, the app calls `POST {endpoint}/api/devices/register` (`DeviceRegistrationService`) with its `deviceId` and platform, so the backend knows this device exists.
-3. **Socket connection** — the app connects to the backend's Socket.IO server and joins a room named after its `deviceId` (`SocketService`). The backend tracks this device as online for as long as the socket stays connected.
-4. **Receiving SMS jobs** — when the backend has an SMS job addressed to this device's `deviceId`, it emits an `"sms"` event with `{ to, content }`. The app sends the SMS natively via `SmsApi` (an Android `MethodChannel` wrapping `SmsManager`).
-5. **Local HTTP server** — the app also runs a local Shelf server on port `8080` with a `POST /send_sms` endpoint, for sending an SMS directly over LAN without going through the backend at all. This is independent of the socket/device-id flow above.
+Settings are saved on the phone and the app reconnects automatically on launch.
+
+## How it works
 
 ```
-App (gateway device)                         Backend (messaging-service)
-──────────────────────                       ───────────────────────────
-1. generate/load deviceId
-2. POST /api/devices/register ───────────────▶ upsert Device row
-3. socket.emit("join", deviceId) ────────────▶ join Socket.IO room = deviceId
-                                                  (Device.isOnline = true)
-                                 ◀──────────── 4. socket.emit("sms", {to, content})
-5. SmsApi.sendSms(to, content)
-   → native SmsManager → carrier
+Phone (this app)                                 CRM backend
+────────────────                                 ───────────
+1. device id (UUID, generated once, persisted)
+2. POST /api/devices/register
+   header x-gateway-token ──────────────────────▶ token → organization, upsert Device
+3. socket.io connect, auth {token} ─────────────▶ rejected unless token is valid
+   emit "join" deviceId ────────────────────────▶ Device online (this organization)
+                                 ◀────────────── 4. emit "sms" { to, content }
+5. SmsManager → SIM → carrier
 ```
 
----
+- The token identifies the **organization**, so a phone only ever receives that organization's messages.
+- If the token is regenerated in the CRM, connected phones are disconnected; paste the new token and tap **Connect**.
+- The socket reconnects on its own after network drops and re-joins its room.
+- Incoming jobs are sent natively through `SmsApi` (Android `MethodChannel` over `SmsManager`). Failures are shown on screen.
 
-## Project Structure
+> The CRM marks a message **Sent** when it has been handed to this app. Carrier delivery receipts are not reported back yet.
+
+## Local HTTP endpoint
+
+The app also serves `POST /send_sms` on port `8080` for sending over the LAN. It now requires the same gateway token:
+
+```bash
+curl -X POST http://<phone-ip>:8080/send_sms \
+  -H "Content-Type: application/json" \
+  -H "x-gateway-token: <your gateway token>" \
+  -d '{"phone": "+251912345678", "message": "Hello via local server"}'
+```
+
+## Project structure
 
 ```
 lib/
-├── main.dart                              # App entry point
-├── app.dart                               # UI + wiring (local server, device init, socket lifecycle)
-├── sms_api.dart                           # Native SMS send via MethodChannel
+├── main.dart                              # entry point
+├── app.dart                               # UI + wiring (local server, connect, SMS handling)
+├── sms_api.dart                           # native SMS send via MethodChannel
 └── services/
-    ├── device_identity_service.dart       # Generates/persists the device's UUID
-    ├── device_registration_service.dart   # Registers the device with the backend
-    └── socket_service.dart                # Socket.IO connect/join/listen lifecycle
+    ├── settings_service.dart              # persists server address, token, device name
+    ├── device_identity_service.dart       # generates/persists the device UUID
+    ├── device_registration_service.dart   # token-authenticated registration
+    └── socket_service.dart                # authenticated Socket.IO lifecycle
 ```
 
----
-
-## Getting Started
-
-### Prerequisites
-- Flutter SDK `^3.7.2`
-- An Android device/emulator with SMS capability (SMS permission is requested at runtime)
-- A running instance of [messaging-service](../messaging-service) reachable from the device
-
-### Install & Run
+## Run
 
 ```bash
 flutter pub get
-flutter run
+flutter run        # Android device with a SIM
 ```
 
-On launch, the app:
-1. Starts its local HTTP server on port `8080`.
-2. Generates (or loads) its device id and registers it with the backend endpoint shown in the "Socket Server Endpoint" field (default: `https://messaging.adeylab.com`).
-3. Connects to that backend over Socket.IO and joins its device room.
-
-The device id currently in use is shown on screen for debugging/verification.
-
-### Sending a test SMS through the backend
-
-Once the app shows `Connected: ...`, note the device id displayed in the app, then from the backend send:
-
-```bash
-curl -X POST https://messaging.adeylab.com/api/sms \
-  -H "Content-Type: application/json" \
-  -d '{
-    "deviceId": "<the device id shown in the app>",
-    "to": "+251912345678",
-    "content": "Hello from the gateway"
-  }'
-```
-
-The backend queues the job and relays it over the socket to this exact device, which then sends the real SMS.
-
-### Sending a test SMS over LAN (bypassing the backend)
-
-```bash
-curl -X POST http://<device-ip>:8080/send_sms \
-  -H "Content-Type: application/json" \
-  -d '{"phone": "+251912345678", "message": "Hello via local server"}'
-```
+Keep the phone awake/unrestricted for the app (battery optimisation can stop the connection in the background).
